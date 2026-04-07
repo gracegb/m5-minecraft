@@ -1,0 +1,31 @@
+# Minecraft runtime/server state
+world/
+world_nether/
+world_the_end/
+server.jar
+eula.txt
+logs/
+cache/
+crash-reports/
+libraries/
+versions/
+ops.json
+whitelist.json
+banned-ips.json
+banned-players.json
+usercache.json
+server.properties
+
+# Python local env/cache
+.venv/
+bridge/.env
+cloud/.env
+**/__pycache__/
+*.pyc
+
+# IDE/editor settings
+.vscode/
+m5/.vscode/
+
+# PlatformIO build artifacts
+m5/.pio/
