@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Adafruit_seesaw.h>
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -24,6 +25,23 @@ static const float SHAKE_THRESHOLD = 2.20f;
 static const size_t MAX_JPEG_BYTES = 50000;
 static const int DETAIL_TEXT_TOP = 30;
 static const int DETAIL_TEXT_BOTTOM = 198;
+static const uint8_t SEESAW_I2C_ADDR = 0x50;
+static const uint8_t SEESAW_JOY_X_PIN = 14;
+static const uint8_t SEESAW_JOY_Y_PIN = 15;
+static const uint8_t BUTTON_X = 6;
+static const uint8_t BUTTON_Y = 2;
+static const uint8_t BUTTON_A = 5;
+static const uint8_t BUTTON_B = 1;
+static const uint8_t BUTTON_SELECT = 0;
+static const uint8_t BUTTON_START = 16;
+static const int JOY_CENTER = 512;
+static const int JOY_DEADZONE = 160;
+static const uint32_t JOY_REPEAT_MS = 90;
+static const uint32_t JOY_KEEPALIVE_MS = 300;
+static const uint32_t BUTTON_DEBOUNCE_MS = 90;
+static const uint32_t BUTTON_MASK = (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_A) |
+                                    (1UL << BUTTON_B) | (1UL << BUTTON_SELECT) |
+                                    (1UL << BUTTON_START);
 
 UiMode currentMode = UiMode::HUD;
 GameData gameData;
@@ -33,14 +51,22 @@ BLEServer *bleServer = nullptr;
 BLECharacteristic *gameDataChar = nullptr;
 BLECharacteristic *screenshotChar = nullptr;
 BLECharacteristic *keypressChar = nullptr;
+Adafruit_seesaw seesaw;
 
 bool bridgeConnected = false;
+bool seesawReady = false;
 unsigned long lastHudDrawMs = 0;
 unsigned long lastShakeMs = 0;
 unsigned long lastTouchMs = 0;
+unsigned long lastJoyCmdMs = 0;
+unsigned long lastButtonCmdMs = 0;
 float accelX = 0.0f;
 float accelY = 0.0f;
 float accelZ = 0.0f;
+bool prevButtonA = false;
+bool prevButtonB = false;
+bool prevButtonX = false;
+int lastJoyDir = 0;
 
 std::vector<uint8_t> jpegBuffer;
 uint16_t expectedChunks = 0;
@@ -228,12 +254,12 @@ void drawViewerChrome() {
   M5.Lcd.fillRoundRect(115, 206, 90, 28, 4, DARKGREEN);
   M5.Lcd.fillRoundRect(220, 206, 90, 28, 4, DARKGREEN);
   M5.Lcd.setTextColor(WHITE, DARKGREEN);
-  M5.Lcd.setCursor(30, 214);
-  M5.Lcd.print("LEFT");
-  M5.Lcd.setCursor(136, 214);
-  M5.Lcd.print("RIGHT");
-  M5.Lcd.setCursor(245, 214);
-  M5.Lcd.print("JUMP");
+  M5.Lcd.setCursor(34, 214);
+  M5.Lcd.print("HUD");
+  M5.Lcd.setCursor(130, 214);
+  M5.Lcd.print("DETAIL");
+  M5.Lcd.setCursor(238, 214);
+  M5.Lcd.print("REFRESH");
 }
 
 void drawViewerStatus(bool connected, int screenshotBytes) {
@@ -333,11 +359,11 @@ UiMode handleTouch(UiMode mode) {
   if (mode == UiMode::VIEWER) {
     if (p.y > 206) {
       if (p.x < 100) {
-        sendKeypressCommand("LEFT");
+        return UiMode::HUD;
       } else if (p.x < 210) {
-        sendKeypressCommand("RIGHT");
+        return UiMode::DETAIL;
       } else {
-        sendKeypressCommand("JUMP");
+        sendKeypressCommand("REFRESH");
       }
     } else if (p.y < 24) {
       return UiMode::HUD;
@@ -361,6 +387,89 @@ static void updateShake() {
     lastShakeMs = now;
     sendKeypressCommand("REFRESH");
   }
+}
+
+static void updateJoystickMovement() {
+  if (!bridgeConnected || !seesawReady) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastJoyCmdMs < JOY_REPEAT_MS) {
+    return;
+  }
+
+  int x = seesaw.analogRead(SEESAW_JOY_X_PIN);
+  int y = seesaw.analogRead(SEESAW_JOY_Y_PIN);
+  int dx = x - JOY_CENTER;
+  int dy = y - JOY_CENTER;
+
+  int dir = 0;
+  if (abs(dx) > abs(dy)) {
+    if (dx > JOY_DEADZONE) {
+      dir = 2;
+    } else if (dx < -JOY_DEADZONE) {
+      dir = 1;
+    }
+  } else {
+    if (dy > JOY_DEADZONE) {
+      dir = 3;
+    } else if (dy < -JOY_DEADZONE) {
+      dir = 4;
+    }
+  }
+
+  if (dir != lastJoyDir) {
+    if (dir == 0) sendKeypressCommand("STOP");
+    if (dir == 1) sendKeypressCommand("LEFT");
+    if (dir == 2) sendKeypressCommand("RIGHT");
+    if (dir == 3) sendKeypressCommand("BACK");
+    if (dir == 4) sendKeypressCommand("FORWARD");
+    lastJoyDir = dir;
+    lastJoyCmdMs = now;
+    return;
+  }
+
+  // Keepalive movement command in case a BLE packet is dropped.
+  if (dir != 0 && (now - lastJoyCmdMs) >= JOY_KEEPALIVE_MS) {
+    if (dir == 1) sendKeypressCommand("LEFT");
+    if (dir == 2) sendKeypressCommand("RIGHT");
+    if (dir == 3) sendKeypressCommand("BACK");
+    if (dir == 4) sendKeypressCommand("FORWARD");
+    lastJoyCmdMs = now;
+  }
+}
+
+static void updateGamepadButtons() {
+  if (!bridgeConnected || !seesawReady) {
+    return;
+  }
+
+  uint32_t buttonState = seesaw.digitalReadBulk(BUTTON_MASK);
+  bool buttonA = !(buttonState & (1UL << BUTTON_A));
+  bool buttonB = !(buttonState & (1UL << BUTTON_B));
+  bool buttonX = !(buttonState & (1UL << BUTTON_X));
+
+  unsigned long now = millis();
+  bool debounceReady = (now - lastButtonCmdMs) >= BUTTON_DEBOUNCE_MS;
+
+  if (debounceReady) {
+    // Edge-trigger behavior so hold does not spam.
+    if (buttonA && !prevButtonA) {
+      sendKeypressCommand("JUMP");
+      lastButtonCmdMs = now;
+    } else if (buttonB && !prevButtonB) {
+      sendKeypressCommand("ATTACK");
+      lastButtonCmdMs = now;
+    } else if (buttonX && !prevButtonX) {
+      sendKeypressCommand("PLACE");
+      lastButtonCmdMs = now;
+    }
+  }
+
+  prevButtonA = buttonA;
+  prevButtonB = buttonB;
+  prevButtonX = buttonX;
 }
 
 static void setupBlePeripheral() {
@@ -404,6 +513,16 @@ void setup() {
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tjpgOutput);
 
+  seesawReady = seesaw.begin(SEESAW_I2C_ADDR);
+  if (seesawReady) {
+    seesaw.pinMode(BUTTON_X, INPUT_PULLUP);
+    seesaw.pinMode(BUTTON_Y, INPUT_PULLUP);
+    seesaw.pinMode(BUTTON_A, INPUT_PULLUP);
+    seesaw.pinMode(BUTTON_B, INPUT_PULLUP);
+    seesaw.pinMode(BUTTON_SELECT, INPUT_PULLUP);
+    seesaw.pinMode(BUTTON_START, INPUT_PULLUP);
+  }
+
   setupBlePeripheral();
   drawHudScreen(gameData);
 }
@@ -412,6 +531,8 @@ void loop() {
   M5.update();
   M5.IMU.getAccelData(&accelX, &accelY, &accelZ);
   updateShake();
+  updateJoystickMovement();
+  updateGamepadButtons();
 
   UiMode nextMode = handleTouch(currentMode);
   if (nextMode != currentMode) {

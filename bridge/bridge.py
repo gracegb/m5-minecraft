@@ -66,14 +66,18 @@ session = {
     "screenshots_sent": 0,
     "coords_visited": [],
 }
+_rcon_password_warned = False
 
 
 # ── RCON helpers ──────────────────────────────────────────────────────────────
 
 def rcon_command(cmd: str) -> str:
     """Run a single RCON command and return the response string."""
+    global _rcon_password_warned
     if not RCON_PASSWORD:
-        log.warning("RCON_PASSWORD is not set. Set it via environment variable.")
+        if not _rcon_password_warned:
+            log.warning("RCON_PASSWORD is not set. Set it via environment variable.")
+            _rcon_password_warned = True
         return ""
     try:
         with MCRcon(RCON_HOST, RCON_PASSWORD, RCON_PORT) as rc:
@@ -257,13 +261,16 @@ def handle_keypress(command: str):
     """
     Receives a keypress command string from the M5 and injects it into
     the active Minecraft window using pyautogui.
-    Commands: LEFT, RIGHT, JUMP, REFRESH
+    Commands: LEFT, RIGHT, FORWARD, BACK, STOP, JUMP, ATTACK, PLACE, REFRESH
     """
     import pyautogui
+    pyautogui.PAUSE = 0
 
     key_map = {
         "LEFT":  "a",
         "RIGHT": "d",
+        "FORWARD": "w",
+        "BACK": "s",
         "JUMP":  "space",
     }
 
@@ -275,18 +282,41 @@ def handle_keypress(command: str):
         bridge_state["screenshot_requested"] = True
         return
 
+    movement_key = key_map.get(cmd)
+    if movement_key and cmd in {"LEFT", "RIGHT", "FORWARD", "BACK"}:
+        current = bridge_state.get("movement_key")
+        if current != movement_key:
+            if current:
+                pyautogui.keyUp(current)
+            pyautogui.keyDown(movement_key)
+            bridge_state["movement_key"] = movement_key
+        return
+
+    if cmd == "STOP":
+        current = bridge_state.get("movement_key")
+        if current:
+            pyautogui.keyUp(current)
+            bridge_state["movement_key"] = None
+        return
+
+    if cmd == "ATTACK":
+        pyautogui.click(button="left")
+        return
+
+    if cmd == "PLACE":
+        pyautogui.click(button="right")
+        return
+
     key = key_map.get(cmd)
     if key:
-        # Brief tap — hold for 150ms then release (feels natural in Minecraft)
-        pyautogui.keyDown(key)
-        time.sleep(0.15)
-        pyautogui.keyUp(key)
+        pyautogui.press(key)
 
 
 # ── Shared bridge state (used across async tasks) ─────────────────────────────
 bridge_state = {
     "screenshot_requested": False,
     "client": None,
+    "movement_key": None,
 }
 
 
@@ -354,6 +384,8 @@ async def screenshot_loop(client: BleakClient):
                 log.info(f"Sending {len(chunks)} chunks ({len(jpeg)} bytes JPEG)")
 
                 for i, chunk in enumerate(chunks):
+                    if not client.is_connected:
+                        raise ConnectionError("disconnected")
                     await client.write_gatt_char(
                         SCREENSHOT_CHAR_UUID, chunk, response=True
                     )
@@ -366,6 +398,10 @@ async def screenshot_loop(client: BleakClient):
                 cloud_log("screenshot")
 
             except Exception as e:
+                msg = str(e).lower()
+                if "disconnect" in msg or "not connected" in msg:
+                    log.info("Screenshot loop stopped: BLE disconnected")
+                    break
                 log.error(f"Screenshot error: {e}")
 
         await asyncio.sleep(0.1)
@@ -406,6 +442,14 @@ async def run_bridge():
         finally:
             try:
                 await client.stop_notify(KEYPRESS_CHAR_UUID)
+            except Exception:
+                pass
+            try:
+                import pyautogui
+                current = bridge_state.get("movement_key")
+                if current:
+                    pyautogui.keyUp(current)
+                    bridge_state["movement_key"] = None
             except Exception:
                 pass
             cloud_log("disconnect")
