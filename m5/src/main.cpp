@@ -38,7 +38,7 @@ static const int JOY_CENTER = 512;
 static const int JOY_DEADZONE = 160;
 static const uint32_t JOY_REPEAT_MS = 90;
 static const uint32_t JOY_KEEPALIVE_MS = 300;
-static const uint32_t BUTTON_DEBOUNCE_MS = 90;
+static const uint32_t BUTTON_DEBOUNCE_MS = 40;
 static const uint32_t BUTTON_MASK = (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_A) |
                                     (1UL << BUTTON_B) | (1UL << BUTTON_SELECT) |
                                     (1UL << BUTTON_START);
@@ -66,6 +66,9 @@ float accelZ = 0.0f;
 bool prevButtonA = false;
 bool prevButtonB = false;
 bool prevButtonX = false;
+bool prevButtonY = false;
+bool prevButtonSelect = false;
+bool prevButtonStart = false;
 int lastJoyDir = 0;
 
 std::vector<uint8_t> jpegBuffer;
@@ -407,15 +410,15 @@ static void updateJoystickMovement() {
   int dir = 0;
   if (abs(dx) > abs(dy)) {
     if (dx > JOY_DEADZONE) {
-      dir = 2;
+      dir = 2;  // right
     } else if (dx < -JOY_DEADZONE) {
-      dir = 1;
+      dir = 1;  // left
     }
   } else {
     if (dy > JOY_DEADZONE) {
-      dir = 3;
+      dir = 3;  // back
     } else if (dy < -JOY_DEADZONE) {
-      dir = 4;
+      dir = 4;  // forward
     }
   }
 
@@ -449,20 +452,48 @@ static void updateGamepadButtons() {
   bool buttonA = !(buttonState & (1UL << BUTTON_A));
   bool buttonB = !(buttonState & (1UL << BUTTON_B));
   bool buttonX = !(buttonState & (1UL << BUTTON_X));
+  bool buttonY = !(buttonState & (1UL << BUTTON_Y));
+  bool buttonSelect = !(buttonState & (1UL << BUTTON_SELECT));
+  bool buttonStart = !(buttonState & (1UL << BUTTON_START));
 
   unsigned long now = millis();
   bool debounceReady = (now - lastButtonCmdMs) >= BUTTON_DEBOUNCE_MS;
 
   if (debounceReady) {
-    // Edge-trigger behavior so hold does not spam.
-    if (buttonA && !prevButtonA) {
+    // Requested mapping:
+    // B->JUMP, A->PUNCH, Y->PLACE, X->CROUCH (hold), SELECT->INVENTORY.
+    if (buttonB && !prevButtonB) {
       sendKeypressCommand("JUMP");
       lastButtonCmdMs = now;
-    } else if (buttonB && !prevButtonB) {
-      sendKeypressCommand("ATTACK");
+    }
+    if (buttonA && !prevButtonA) {
+      sendKeypressCommand("PUNCH");
       lastButtonCmdMs = now;
-    } else if (buttonX && !prevButtonX) {
+    }
+    if (buttonY && !prevButtonY) {
       sendKeypressCommand("PLACE");
+      lastButtonCmdMs = now;
+    }
+    if (buttonX != prevButtonX) {
+      sendKeypressCommand(buttonX ? "DOWN:SHIFT" : "UP:SHIFT");
+      lastButtonCmdMs = now;
+    }
+    if (buttonSelect && !prevButtonSelect) {
+      sendKeypressCommand("INVENTORY");
+      lastButtonCmdMs = now;
+    }
+    // START toggles viewer on M5 only.
+    if (buttonStart && !prevButtonStart) {
+      currentMode = (currentMode == UiMode::VIEWER) ? UiMode::HUD : UiMode::VIEWER;
+      if (currentMode == UiMode::HUD) {
+        drawHudScreen(gameData);
+      } else {
+        drawViewerChrome();
+        if (!jpegBuffer.empty()) {
+          TJpgDec.drawJpg(0, 24, jpegBuffer.data(), jpegBuffer.size());
+        }
+        drawViewerStatus(bridgeConnected, jpegBuffer.size());
+      }
       lastButtonCmdMs = now;
     }
   }
@@ -470,6 +501,9 @@ static void updateGamepadButtons() {
   prevButtonA = buttonA;
   prevButtonB = buttonB;
   prevButtonX = buttonX;
+  prevButtonY = buttonY;
+  prevButtonSelect = buttonSelect;
+  prevButtonStart = buttonStart;
 }
 
 static void setupBlePeripheral() {

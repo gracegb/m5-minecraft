@@ -40,6 +40,8 @@ CLOUD_GET_URL = os.environ.get(
     "https://us-central1-craftcompanion-492604.cloudfunctions.net/session-api?action=get",
 )
 CLOUD_TIMEOUT = int(os.environ.get("CLOUD_TIMEOUT_SECONDS", 5))
+AUTO_FOCUS_WINDOW = os.environ.get("AUTO_FOCUS_WINDOW", "1") == "1"
+LOOK_GAIN = float(os.environ.get("LOOK_GAIN", "4.0"))
 
 # BLE device name advertised by the M5Core2
 M5_DEVICE_NAME = "CraftCompanion"
@@ -261,7 +263,8 @@ def handle_keypress(command: str):
     """
     Receives a keypress command string from the M5 and injects it into
     the active Minecraft window using pyautogui.
-    Commands: LEFT, RIGHT, FORWARD, BACK, STOP, JUMP, ATTACK, PLACE, REFRESH
+    Commands: movement (LEFT/RIGHT/FORWARD/BACK/STOP), button actions,
+    and hold keys via DOWN:key / UP:key.
     """
     import pyautogui
     pyautogui.PAUSE = 0
@@ -277,9 +280,48 @@ def handle_keypress(command: str):
     cmd = command.strip().upper()
     log.info(f"Keypress received: {cmd}")
 
+    if AUTO_FOCUS_WINDOW and cmd != "REFRESH":
+        focus_minecraft_window()
+
     if cmd == "REFRESH":
         # Signal the screenshot loop — handled via the shared flag below
         bridge_state["screenshot_requested"] = True
+        return
+
+    if cmd.startswith("LOOK:"):
+        try:
+            payload = cmd.split(":", 1)[1]
+            sx, sy = payload.split(",", 1)
+            raw_x = int(sx)
+            raw_y = int(sy)
+            dx = int(raw_x * LOOK_GAIN)
+            dy = int(raw_y * LOOK_GAIN)
+            if dx == 0 and raw_x != 0:
+                dx = 1 if raw_x > 0 else -1
+            if dy == 0 and raw_y != 0:
+                dy = 1 if raw_y > 0 else -1
+            if dx != 0 or dy != 0:
+                pyautogui.moveRel(dx, dy, duration=0)
+        except Exception:
+            pass
+        return
+
+    if cmd.startswith("DOWN:"):
+        key = cmd.split(":", 1)[1].strip().lower()
+        if key:
+            held = bridge_state["held_keys"]
+            if key not in held:
+                pyautogui.keyDown(key)
+                held.add(key)
+        return
+
+    if cmd.startswith("UP:"):
+        key = cmd.split(":", 1)[1].strip().lower()
+        if key:
+            held = bridge_state["held_keys"]
+            if key in held:
+                pyautogui.keyUp(key)
+                held.remove(key)
         return
 
     movement_key = key_map.get(cmd)
@@ -299,7 +341,7 @@ def handle_keypress(command: str):
             bridge_state["movement_key"] = None
         return
 
-    if cmd == "ATTACK":
+    if cmd in {"ATTACK", "PUNCH"}:
         pyautogui.click(button="left")
         return
 
@@ -307,9 +349,17 @@ def handle_keypress(command: str):
         pyautogui.click(button="right")
         return
 
+    if cmd == "INVENTORY":
+        pyautogui.press("e")
+        return
+
     key = key_map.get(cmd)
     if key:
         pyautogui.press(key)
+        return
+
+    if len(cmd) == 1 and cmd.isalpha():
+        pyautogui.press(cmd.lower())
 
 
 # ── Shared bridge state (used across async tasks) ─────────────────────────────
@@ -317,7 +367,31 @@ bridge_state = {
     "screenshot_requested": False,
     "client": None,
     "movement_key": None,
+    "last_focus_at": 0.0,
+    "held_keys": set(),
 }
+
+
+def focus_minecraft_window() -> None:
+    """Best-effort focus of the Minecraft Java window on macOS."""
+    now = time.monotonic()
+    if now - bridge_state.get("last_focus_at", 0.0) < 0.8:
+        return
+    bridge_state["last_focus_at"] = now
+
+    script = """
+    tell application "System Events"
+        if exists process "java" then
+            tell process "java"
+                set frontmost to true
+            end tell
+        end if
+    end tell
+    """
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
+    except Exception:
+        pass
 
 
 # ── BLE notification callback ─────────────────────────────────────────────────
@@ -450,6 +524,10 @@ async def run_bridge():
                 if current:
                     pyautogui.keyUp(current)
                     bridge_state["movement_key"] = None
+                held = bridge_state.get("held_keys", set())
+                for key in list(held):
+                    pyautogui.keyUp(key)
+                    held.remove(key)
             except Exception:
                 pass
             cloud_log("disconnect")
