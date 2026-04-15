@@ -71,9 +71,15 @@ bool prevButtonSelect = false;
 bool prevButtonStart = false;
 int lastJoyDir = 0;
 
-std::vector<uint8_t> jpegBuffer;
+std::vector<uint8_t> assemblingJpegBuffer;
+std::vector<uint8_t> displayJpegBuffer;
 uint16_t expectedChunks = 0;
 uint16_t chunksReceived = 0;
+bool screenshotFrameReady = false;
+uint16_t assemblingFrameId = 0;
+uint16_t latestFrameIdReceived = 0;
+uint16_t latestFrameIdRendered = 0;
+uint32_t framesDropped = 0;
 
 bool tjpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
   M5.Lcd.pushImage(x, y, w, h, bitmap);
@@ -94,8 +100,8 @@ static void sendKeypressCommand(const char *cmd) {
   keypressChar->notify();
 }
 
-static void decodeAndRenderJpeg() {
-  if (jpegBuffer.empty()) {
+static void decodeAndRenderJpeg(const std::vector<uint8_t> &frame) {
+  if (frame.empty()) {
     return;
   }
   if (currentMode != UiMode::VIEWER) {
@@ -103,8 +109,8 @@ static void decodeAndRenderJpeg() {
   }
   drawViewerChrome();
   M5.Lcd.fillRect(0, 24, 320, 182, BLACK);
-  TJpgDec.drawJpg(0, 24, jpegBuffer.data(), jpegBuffer.size());
-  drawViewerStatus(bridgeConnected, jpegBuffer.size());
+  TJpgDec.drawJpg(0, 24, frame.data(), frame.size());
+  drawViewerStatus(bridgeConnected, frame.size());
 }
 
 static void parseAndStoreGameData(const std::string &payload) {
@@ -146,7 +152,7 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
     bridgeConnected = true;
     if (currentMode == UiMode::VIEWER) {
-      drawViewerStatus(true, jpegBuffer.size());
+      drawViewerStatus(true, displayJpegBuffer.size());
     } else if (currentMode == UiMode::HUD) {
       drawHudScreen(gameData);
     } else if (currentMode == UiMode::DETAIL) {
@@ -158,7 +164,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     bridgeConnected = false;
     BLEDevice::startAdvertising();
     if (currentMode == UiMode::VIEWER) {
-      drawViewerStatus(false, jpegBuffer.size());
+      drawViewerStatus(false, displayJpegBuffer.size());
     } else if (currentMode == UiMode::HUD) {
       drawHudScreen(gameData);
     } else if (currentMode == UiMode::DETAIL) {
@@ -180,35 +186,79 @@ class GameDataCallbacks : public BLECharacteristicCallbacks {
 class ScreenshotCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     std::string value = characteristic->getValue();
-    if (value.size() < 4) {
+    if (value.size() < 6) {
       return;
     }
 
     const uint8_t *data = reinterpret_cast<const uint8_t *>(value.data());
-    uint16_t idx = (static_cast<uint16_t>(data[0]) << 8) | data[1];
-    uint16_t total = (static_cast<uint16_t>(data[2]) << 8) | data[3];
-    size_t payloadLen = value.size() - 4;
+    uint16_t frameId = (static_cast<uint16_t>(data[0]) << 8) | data[1];
+    uint16_t idx = (static_cast<uint16_t>(data[2]) << 8) | data[3];
+    uint16_t total = (static_cast<uint16_t>(data[4]) << 8) | data[5];
+    size_t payloadLen = value.size() - 6;
 
     if (idx == 0) {
-      jpegBuffer.clear();
-      jpegBuffer.reserve(MAX_JPEG_BYTES);
+      assemblingJpegBuffer.clear();
+      assemblingJpegBuffer.reserve(MAX_JPEG_BYTES);
+      assemblingFrameId = frameId;
       expectedChunks = total;
       chunksReceived = 0;
     }
 
+    if (expectedChunks == 0 || frameId != assemblingFrameId) {
+      return;
+    }
+
     if (idx == total && payloadLen == 0) {
       if (expectedChunks > 0 && chunksReceived >= expectedChunks) {
-        decodeAndRenderJpeg();
+        displayJpegBuffer.swap(assemblingJpegBuffer);
+        screenshotFrameReady = true;
+        latestFrameIdReceived = frameId;
+        Serial.printf("FRAME RX id=%u bytes=%u chunks=%u\n", latestFrameIdReceived,
+                      (unsigned int)displayJpegBuffer.size(), (unsigned int)chunksReceived);
+        expectedChunks = 0;
+        chunksReceived = 0;
+      } else {
+        framesDropped++;
       }
       return;
     }
 
-    if ((jpegBuffer.size() + payloadLen) > MAX_JPEG_BYTES) {
+    if (expectedChunks == 0 || idx >= expectedChunks) {
       return;
     }
 
-    jpegBuffer.insert(jpegBuffer.end(), data + 4, data + value.size());
+    // Require in-order delivery; if a chunk is missing, drop the frame and wait
+    // for the next frame start (idx == 0).
+    if (idx != chunksReceived) {
+      assemblingJpegBuffer.clear();
+      expectedChunks = 0;
+      chunksReceived = 0;
+      framesDropped++;
+      return;
+    }
+
+    if ((assemblingJpegBuffer.size() + payloadLen) > MAX_JPEG_BYTES) {
+      assemblingJpegBuffer.clear();
+      expectedChunks = 0;
+      chunksReceived = 0;
+      framesDropped++;
+      return;
+    }
+
+    assemblingJpegBuffer.insert(assemblingJpegBuffer.end(), data + 6, data + value.size());
     chunksReceived++;
+
+    // Fallback complete path: treat receipt of last data chunk as end-of-frame,
+    // even if the explicit EOF sentinel is dropped.
+    if (expectedChunks > 0 && idx + 1 == expectedChunks && chunksReceived >= expectedChunks) {
+      displayJpegBuffer.swap(assemblingJpegBuffer);
+      screenshotFrameReady = true;
+      latestFrameIdReceived = frameId;
+      Serial.printf("FRAME RX id=%u bytes=%u chunks=%u (no eof)\n", latestFrameIdReceived,
+                    (unsigned int)displayJpegBuffer.size(), (unsigned int)chunksReceived);
+      expectedChunks = 0;
+      chunksReceived = 0;
+    }
   }
 };
 
@@ -269,7 +319,8 @@ void drawViewerStatus(bool connected, int screenshotBytes) {
   M5.Lcd.fillRect(150, 0, 170, 24, DARKGREY);
   M5.Lcd.setTextColor(WHITE, DARKGREY);
   M5.Lcd.setCursor(154, 6);
-  M5.Lcd.printf("%s %dB", connected ? "ON" : "WAIT", screenshotBytes);
+  M5.Lcd.printf("%s F%u R%u", connected ? "ON" : "WAIT", latestFrameIdReceived,
+                latestFrameIdRendered);
 }
 
 static void drawWrappedDetailText(const String &text) {
@@ -489,10 +540,10 @@ static void updateGamepadButtons() {
         drawHudScreen(gameData);
       } else {
         drawViewerChrome();
-        if (!jpegBuffer.empty()) {
-          TJpgDec.drawJpg(0, 24, jpegBuffer.data(), jpegBuffer.size());
+        if (!displayJpegBuffer.empty()) {
+          TJpgDec.drawJpg(0, 24, displayJpegBuffer.data(), displayJpegBuffer.size());
         }
-        drawViewerStatus(bridgeConnected, jpegBuffer.size());
+        drawViewerStatus(bridgeConnected, displayJpegBuffer.size());
       }
       lastButtonCmdMs = now;
     }
@@ -575,10 +626,10 @@ void loop() {
       drawHudScreen(gameData);
     } else if (currentMode == UiMode::VIEWER) {
       drawViewerChrome();
-      if (!jpegBuffer.empty()) {
-        TJpgDec.drawJpg(0, 24, jpegBuffer.data(), jpegBuffer.size());
+      if (!displayJpegBuffer.empty()) {
+        TJpgDec.drawJpg(0, 24, displayJpegBuffer.data(), displayJpegBuffer.size());
       }
-      drawViewerStatus(bridgeConnected, jpegBuffer.size());
+      drawViewerStatus(bridgeConnected, displayJpegBuffer.size());
     } else {
       drawDetailScreen(detailText);
     }
@@ -588,6 +639,16 @@ void loop() {
   if (currentMode == UiMode::HUD && (now - lastHudDrawMs) > 2000) {
     lastHudDrawMs = now;
     drawHudScreen(gameData);
+  }
+
+  if (screenshotFrameReady) {
+    screenshotFrameReady = false;
+    latestFrameIdRendered = latestFrameIdReceived;
+    Serial.printf("FRAME DRAW id=%u bytes=%u dropped=%lu\n", latestFrameIdRendered,
+                  (unsigned int)displayJpegBuffer.size(), (unsigned long)framesDropped);
+    if (currentMode == UiMode::VIEWER) {
+      decodeAndRenderJpeg(displayJpegBuffer);
+    }
   }
 
   delay(30);

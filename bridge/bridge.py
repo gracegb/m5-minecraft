@@ -55,12 +55,15 @@ KEYPRESS_CHAR_UUID    = "12345678-1234-1234-1234-123456789003"
 SCREENSHOT_WIDTH  = 320
 SCREENSHOT_HEIGHT = 240
 JPEG_QUALITY      = 35          # lower = smaller BLE payload, faster transfer
-CHUNK_SIZE        = 490         # bytes per BLE packet (safe under 512 MTU)
+CHUNK_SIZE        = int(os.environ.get("SCREENSHOT_CHUNK_SIZE", 180))
+CHUNK_DELAY       = float(os.environ.get("SCREENSHOT_CHUNK_DELAY_SECONDS", 0.005))
 
-# How often to push game data to M5 (seconds)
-GAME_DATA_INTERVAL = 2.0
+# How often to poll/send game data (seconds)
+PLAYER_POLL_INTERVAL = float(os.environ.get("PLAYER_POLL_INTERVAL_SECONDS", 6.0))
 DETAIL_INTERVAL = 10.0
 SCREENSHOT_INTERVAL = float(os.environ.get("SCREENSHOT_INTERVAL_SECONDS", 1.0))
+SCREENSHOT_INTERVAL = max(0.3, min(SCREENSHOT_INTERVAL, 2.0))
+RECONNECT_DELAY = float(os.environ.get("BLE_RECONNECT_DELAY_SECONDS", 2.0))
 
 # ── Session state ─────────────────────────────────────────────────────────────
 session = {
@@ -89,16 +92,10 @@ def rcon_command(cmd: str) -> str:
         return ""
 
 
-def get_game_data() -> dict:
-    """
-    Pull current game state from Minecraft via RCON.
-    Returns a dict ready to JSON-encode and send over BLE.
-    """
-    # Player list
-    player_resp = rcon_command("list")
-    # e.g. "There are 1 of a max of 20 players online: GraceB"
+def parse_player_list_response(player_resp: str) -> tuple[int, list[str]]:
+    """Parse the output from the Minecraft `list` command."""
     player_count = 0
-    player_names = []
+    player_names: list[str] = []
     if "players online:" in player_resp:
         try:
             player_count = int(player_resp.split("There are ")[1].split(" of")[0])
@@ -106,6 +103,30 @@ def get_game_data() -> dict:
             player_names = [n.strip() for n in names_part.split(",") if n.strip()]
         except Exception:
             pass
+    return player_count, player_names
+
+
+def get_player_overview() -> dict:
+    """Fetch only player roster data for low-bandwidth BLE updates."""
+    player_resp = rcon_command("list")
+    player_count, player_names = parse_player_list_response(player_resp)
+    return {
+        "player_count": player_count,
+        "players": player_names,
+        "coords": {},
+        "server": f"{RCON_HOST}:{RCON_PORT}",
+        "ts": int(time.time()),
+    }
+
+
+def get_game_data() -> dict:
+    """
+    Pull current game state from Minecraft via RCON.
+    Returns a dict ready to JSON-encode and send over BLE.
+    """
+    # Player list
+    player_resp = rcon_command("list")
+    player_count, player_names = parse_player_list_response(player_resp)
 
     # Coordinates for each online player
     coords = {}
@@ -176,21 +197,24 @@ def capture_screenshot() -> bytes:
     return buf.getvalue()
 
 
-def build_chunks(jpeg_bytes: bytes) -> list[bytes]:
+def build_chunks(jpeg_bytes: bytes) -> tuple[int, list[bytes]]:
     """
     Split JPEG bytes into BLE-sized chunks.
-    Packet format: [chunk_index: 2 bytes big-endian] [total_chunks: 2 bytes] [payload]
+    Packet format:
+      [frame_id: 2 bytes big-endian] [chunk_index: 2 bytes] [total_chunks: 2 bytes] [payload]
     A final empty payload with chunk_index == total_chunks signals end-of-image.
     """
+    frame_id = bridge_state.get("next_frame_id", 0) & 0xFFFF
+    bridge_state["next_frame_id"] = (frame_id + 1) & 0xFFFF
     total = (len(jpeg_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE
     chunks = []
     for i in range(total):
         payload = jpeg_bytes[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
-        header = struct.pack(">HH", i, total)
+        header = struct.pack(">HHH", frame_id, i, total)
         chunks.append(header + payload)
     # EOF sentinel: index == total, empty payload
-    chunks.append(struct.pack(">HH", total, total))
-    return chunks
+    chunks.append(struct.pack(">HHH", frame_id, total, total))
+    return frame_id, chunks
 
 
 # ── GCP helpers ───────────────────────────────────────────────────────────────
@@ -365,10 +389,14 @@ def handle_keypress(command: str):
 # ── Shared bridge state (used across async tasks) ─────────────────────────────
 bridge_state = {
     "screenshot_requested": False,
+    "screenshot_in_flight": False,
     "client": None,
     "movement_key": None,
     "last_focus_at": 0.0,
     "held_keys": set(),
+    "ble_write_lock": None,
+    "last_player_signature": None,
+    "next_frame_id": 0,
 }
 
 
@@ -407,29 +435,55 @@ def on_keypress_notify(sender, data: bytearray):
 
 # ── Async tasks ───────────────────────────────────────────────────────────────
 
+async def ble_write(client: BleakClient, uuid: str, payload: bytes, response: bool):
+    """Serialize BLE writes to avoid overlapping GATT operations."""
+    lock = bridge_state.get("ble_write_lock")
+    if lock is None:
+        await client.write_gatt_char(uuid, payload, response=response)
+        return
+    async with lock:
+        await client.write_gatt_char(uuid, payload, response=response)
+
+
 async def game_data_loop(client: BleakClient):
-    """Push game data to M5 every GAME_DATA_INTERVAL seconds."""
-    log.info("Game data loop started")
-    while client.is_connected:
+    """Poll roster and push to M5 only when player list/count changes."""
+    log.info("Game data loop started (change-driven)")
+    bridge_state["last_player_signature"] = None
+    while True:
+        if not client.is_connected:
+            log.info("Game data loop stopped: BLE disconnected")
+            break
         try:
-            data = get_game_data()
-            payload = json.dumps(data).encode("utf-8")
-            await client.write_gatt_char(GAME_DATA_CHAR_UUID, payload, response=False)
-            log.info(f"Game data sent: {data['player_count']} players")
+            if bridge_state.get("screenshot_in_flight"):
+                await asyncio.sleep(PLAYER_POLL_INTERVAL)
+                continue
+            data = await asyncio.to_thread(get_player_overview)
+            signature = (data["player_count"], tuple(data["players"]))
+            if signature != bridge_state.get("last_player_signature"):
+                bridge_state["last_player_signature"] = signature
+                payload = json.dumps(data).encode("utf-8")
+                await ble_write(client, GAME_DATA_CHAR_UUID, payload, response=False)
+                log.info(f"Roster update sent: {data['player_count']} players")
         except Exception as e:
             log.warning(f"Game data loop error: {e}")
-        await asyncio.sleep(GAME_DATA_INTERVAL)
+        await asyncio.sleep(PLAYER_POLL_INTERVAL)
 
 
 async def detail_loop(client: BleakClient):
     """Push latest cloud session summary text for the M5 detail panel."""
     log.info("Detail loop started")
-    while client.is_connected:
+    while True:
+        if not client.is_connected:
+            log.info("Detail loop stopped: BLE disconnected")
+            break
         try:
-            latest = cloud_get_session()
+            if bridge_state.get("screenshot_in_flight"):
+                await asyncio.sleep(DETAIL_INTERVAL)
+                continue
+            latest = await asyncio.to_thread(cloud_get_session)
             detail_text = build_detail_text(latest)
             payload = json.dumps({"detail": detail_text}).encode("utf-8")
-            await client.write_gatt_char(GAME_DATA_CHAR_UUID, payload, response=False)
+            await ble_write(client, GAME_DATA_CHAR_UUID, payload, response=False)
             log.info("Detail payload sent")
         except Exception as e:
             log.warning(f"Detail loop error: {e}")
@@ -442,47 +496,60 @@ async def screenshot_loop(client: BleakClient):
     Also honors manual REFRESH requests from the M5.
     """
     log.info("Screenshot loop started")
+    log.info(f"Screenshot cadence configured: every {SCREENSHOT_INTERVAL:.2f}s")
     bridge_state["screenshot_requested"] = True  # send one immediately on connect
-    last_sent_at = 0.0
+    next_due_at = time.monotonic()
 
-    while client.is_connected:
+    while True:
+        if not client.is_connected:
+            log.info("Screenshot loop stopped: BLE disconnected")
+            break
+
         now = time.monotonic()
-        auto_due = (now - last_sent_at) >= SCREENSHOT_INTERVAL
+        auto_due = now >= next_due_at
 
         if bridge_state["screenshot_requested"] or auto_due:
             bridge_state["screenshot_requested"] = False
             try:
                 log.info("Capturing screenshot...")
-                jpeg = capture_screenshot()
-                chunks = build_chunks(jpeg)
-                log.info(f"Sending {len(chunks)} chunks ({len(jpeg)} bytes JPEG)")
+                frame_start = time.monotonic()
+                jpeg = await asyncio.to_thread(capture_screenshot)
+                frame_id, chunks = build_chunks(jpeg)
+                log.info(
+                    f"Sending frame={frame_id} chunks={len(chunks)} jpeg_bytes={len(jpeg)}"
+                )
+                bridge_state["screenshot_in_flight"] = True
 
-                for i, chunk in enumerate(chunks):
+                for chunk in chunks:
                     if not client.is_connected:
                         raise ConnectionError("disconnected")
-                    await client.write_gatt_char(
-                        SCREENSHOT_CHAR_UUID, chunk, response=True
-                    )
+                    await ble_write(client, SCREENSHOT_CHAR_UUID, chunk, response=True)
                     # Small delay between chunks to avoid overwhelming the M5
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(CHUNK_DELAY)
 
                 session["screenshots_sent"] += 1
-                last_sent_at = time.monotonic()
-                log.info("Screenshot sent")
-                cloud_log("screenshot")
+                now_done = time.monotonic()
+                next_due_at = now_done + SCREENSHOT_INTERVAL
+                frame_ms = int((now_done - frame_start) * 1000)
+                log.info(f"Screenshot sent frame={frame_id} in {frame_ms}ms")
 
             except Exception as e:
                 msg = str(e).lower()
-                if "disconnect" in msg or "not connected" in msg:
+                if (not client.is_connected) or ("disconnect" in msg) or ("not connected" in msg):
                     log.info("Screenshot loop stopped: BLE disconnected")
                     break
                 log.error(f"Screenshot error: {e}")
+                # Keep loop alive after transient GATT errors.
+                await asyncio.sleep(0.2)
+            finally:
+                bridge_state["screenshot_in_flight"] = False
 
-        await asyncio.sleep(0.1)
+        # Keep the loop responsive to manual REFRESH while still honoring cadence.
+        await asyncio.sleep(0.05)
 
 
-async def run_bridge():
-    """Main entry point — scan, connect, start all loops."""
+async def run_bridge_once():
+    """Run one BLE connection session until disconnect/error."""
     log.info(f"Scanning for '{M5_DEVICE_NAME}'...")
 
     device = await BleakScanner.find_device_by_name(M5_DEVICE_NAME, timeout=30.0)
@@ -494,17 +561,17 @@ async def run_bridge():
 
     async with BleakClient(device) as client:
         bridge_state["client"] = client
+        bridge_state["ble_write_lock"] = asyncio.Lock()
         log.info("Connected to M5Core2")
 
         # Start session
         session["started_at"] = datetime.now(timezone.utc).isoformat()
-        cloud_log("connect")
+        await asyncio.to_thread(cloud_log, "connect")
 
         # Subscribe to keypress notifications from M5
         await client.start_notify(KEYPRESS_CHAR_UUID, on_keypress_notify)
         log.info("Subscribed to keypress notifications")
 
-        # Run game data and screenshot loops concurrently
         try:
             await asyncio.gather(
                 game_data_loop(client),
@@ -530,8 +597,20 @@ async def run_bridge():
                     held.remove(key)
             except Exception:
                 pass
-            cloud_log("disconnect")
+            await asyncio.to_thread(cloud_log, "disconnect")
+            bridge_state["ble_write_lock"] = None
             log.info("Disconnected — session logged to GCP")
+
+
+async def run_bridge():
+    """Main entry point — reconnect automatically after disconnects."""
+    while True:
+        try:
+            await run_bridge_once()
+        except Exception as e:
+            log.error(f"Bridge crashed: {e}")
+        log.info(f"Retrying BLE scan in {RECONNECT_DELAY:.1f}s...")
+        await asyncio.sleep(RECONNECT_DELAY)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
