@@ -8,10 +8,12 @@ import io
 import json
 import logging
 import os
+import re
 import struct
 import subprocess
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import mss
 import requests
@@ -27,9 +29,36 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+def _load_env_file() -> None:
+    """Load bridge/.env (or .env) without requiring python-dotenv."""
+    env_candidates = [
+        Path(__file__).resolve().parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    for env_path in env_candidates:
+        if not env_path.exists():
+            continue
+        try:
+            for raw in env_path.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        except Exception:
+            pass
+        break
+
+
+_load_env_file()
+
 RCON_HOST = os.environ.get("RCON_HOST", "localhost")
 RCON_PORT = int(os.environ.get("RCON_PORT", 25575))
-RCON_PASSWORD = os.environ.get("RCON_PASSWORD")
+# RCON_PASSWORD = os.environ.get("RCON_PASSWORD") #JUST HARDCODE IT FOR NOW
+RCON_RETRY_COOLDOWN = float(os.environ.get("RCON_RETRY_COOLDOWN_SECONDS", 8.0))
 
 CLOUD_LOG_URL = os.environ.get(
     "CLOUD_LOG_URL",
@@ -72,37 +101,71 @@ session = {
     "coords_visited": [],
 }
 _rcon_password_warned = False
+_rcon_login_failed_until = 0.0
 
 
 # ── RCON helpers ──────────────────────────────────────────────────────────────
 
 def rcon_command(cmd: str) -> str:
     """Run a single RCON command and return the response string."""
-    global _rcon_password_warned
+    global _rcon_password_warned, _rcon_login_failed_until
     if not RCON_PASSWORD:
         if not _rcon_password_warned:
             log.warning("RCON_PASSWORD is not set. Set it via environment variable.")
             _rcon_password_warned = True
         return ""
+    now = time.monotonic()
+    if now < _rcon_login_failed_until:
+        return ""
     try:
         with MCRcon(RCON_HOST, RCON_PASSWORD, RCON_PORT) as rc:
             return rc.command(cmd)
     except Exception as e:
-        log.warning(f"RCON error: {e}")
+        msg = str(e)
+        if "Login failed" in msg:
+            _rcon_login_failed_until = time.monotonic() + RCON_RETRY_COOLDOWN
+            log.warning(
+                "RCON login failed. Check server.properties rcon.password and bridge "
+                f"RCON_PASSWORD. Backing off for {RCON_RETRY_COOLDOWN:.1f}s."
+            )
+        else:
+            log.warning(f"RCON error: {e}")
         return ""
 
 
 def parse_player_list_response(player_resp: str) -> tuple[int, list[str]]:
     """Parse the output from the Minecraft `list` command."""
+    if not player_resp:
+        return 0, []
+
+    cleaned = re.sub(r"\xa7.", "", player_resp)
+    cleaned = cleaned.strip()
     player_count = 0
     player_names: list[str] = []
-    if "players online:" in player_resp:
-        try:
-            player_count = int(player_resp.split("There are ")[1].split(" of")[0])
-            names_part = player_resp.split("players online:")[-1].strip()
-            player_names = [n.strip() for n in names_part.split(",") if n.strip()]
-        except Exception:
-            pass
+
+    # Common Java server format:
+    # "There are 1 of a max of 20 players online: GraceB"
+    match = re.search(
+        r"There are\s+(\d+)\s+of a max of\s+\d+\s+players online:?\s*(.*)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        player_count = int(match.group(1))
+        names_part = (match.group(2) or "").strip()
+        player_names = [n.strip() for n in names_part.split(",") if n.strip()]
+        return player_count, player_names
+
+    # Alternate format variants sometimes returned by proxies/plugins:
+    # "Online players (1/20): GraceB"
+    alt = re.search(r"\((\d+)\s*/\s*\d+\)\s*:\s*(.*)", cleaned)
+    if alt:
+        player_count = int(alt.group(1))
+        names_part = (alt.group(2) or "").strip()
+        player_names = [n.strip() for n in names_part.split(",") if n.strip()]
+        return player_count, player_names
+
+    log.warning(f"Unrecognized RCON list response: {cleaned[:160]}")
     return player_count, player_names
 
 
@@ -311,6 +374,11 @@ def handle_keypress(command: str):
         # Signal the screenshot loop — handled via the shared flag below
         bridge_state["screenshot_requested"] = True
         return
+    if cmd == "DATA_REFRESH":
+        # Signal HUD/data refresh request from the M5.
+        bridge_state["game_data_requested"] = True
+        bridge_state["screenshot_pause_until"] = time.monotonic() + 2.0
+        return
 
     if cmd.startswith("LOOK:"):
         try:
@@ -390,6 +458,7 @@ def handle_keypress(command: str):
 bridge_state = {
     "screenshot_requested": False,
     "screenshot_in_flight": False,
+    "game_data_requested": True,
     "client": None,
     "movement_key": None,
     "last_focus_at": 0.0,
@@ -397,6 +466,7 @@ bridge_state = {
     "ble_write_lock": None,
     "last_player_signature": None,
     "next_frame_id": 0,
+    "screenshot_pause_until": 0.0,
 }
 
 
@@ -454,16 +524,38 @@ async def game_data_loop(client: BleakClient):
             log.info("Game data loop stopped: BLE disconnected")
             break
         try:
-            if bridge_state.get("screenshot_in_flight"):
+            refresh_requested = bool(bridge_state.get("game_data_requested"))
+            if bridge_state.get("screenshot_in_flight") and not refresh_requested:
                 await asyncio.sleep(PLAYER_POLL_INTERVAL)
                 continue
-            data = await asyncio.to_thread(get_player_overview)
-            signature = (data["player_count"], tuple(data["players"]))
-            if signature != bridge_state.get("last_player_signature"):
+            if refresh_requested:
+                bridge_state["game_data_requested"] = False
+                for _ in range(20):
+                    if not bridge_state.get("screenshot_in_flight"):
+                        break
+                    await asyncio.sleep(0.05)
+                data = get_game_data()
+                signature = (data["player_count"], tuple(data["players"]))
                 bridge_state["last_player_signature"] = signature
                 payload = json.dumps(data).encode("utf-8")
-                await ble_write(client, GAME_DATA_CHAR_UUID, payload, response=False)
-                log.info(f"Roster update sent: {data['player_count']} players")
+                await ble_write(client, GAME_DATA_CHAR_UUID, payload, response=True)
+                log.info(
+                    f"Data refresh sent: {data['player_count']} players, "
+                    f"coords_keys={len(data.get('coords', {}))}"
+                )
+                await asyncio.to_thread(cloud_log, "hud_refresh")
+            else:
+                data = get_player_overview()
+                signature = (data["player_count"], tuple(data["players"]))
+                if signature != bridge_state.get("last_player_signature"):
+                    bridge_state["last_player_signature"] = signature
+                    full = get_game_data()
+                    payload = json.dumps(full).encode("utf-8")
+                    await ble_write(client, GAME_DATA_CHAR_UUID, payload, response=True)
+                    log.info(
+                        f"Roster change sent: {full['player_count']} players, "
+                        f"coords_keys={len(full.get('coords', {}))}"
+                    )
         except Exception as e:
             log.warning(f"Game data loop error: {e}")
         await asyncio.sleep(PLAYER_POLL_INTERVAL)
@@ -506,7 +598,7 @@ async def screenshot_loop(client: BleakClient):
             break
 
         now = time.monotonic()
-        auto_due = now >= next_due_at
+        auto_due = now >= next_due_at and now >= bridge_state.get("screenshot_pause_until", 0.0)
 
         if bridge_state["screenshot_requested"] or auto_due:
             bridge_state["screenshot_requested"] = False

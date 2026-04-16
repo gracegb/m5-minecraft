@@ -100,6 +100,10 @@ static void sendKeypressCommand(const char *cmd) {
   keypressChar->notify();
 }
 
+static void requestHudDataRefresh() {
+  sendKeypressCommand("DATA_REFRESH");
+}
+
 static void decodeAndRenderJpeg(const std::vector<uint8_t> &frame) {
   if (frame.empty()) {
     return;
@@ -114,7 +118,7 @@ static void decodeAndRenderJpeg(const std::vector<uint8_t> &frame) {
 }
 
 static void parseAndStoreGameData(const std::string &payload) {
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<6144> doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     return;
@@ -284,13 +288,16 @@ void drawHudScreen(const GameData &data) {
   M5.Lcd.setCursor(12, 168);
   M5.Lcd.printf("Players: %d", data.playersOnline);
 
-  M5.Lcd.fillRoundRect(8, 202, 148, 34, 6, DARKCYAN);
-  M5.Lcd.fillRoundRect(164, 202, 148, 34, 6, DARKCYAN);
+  M5.Lcd.fillRoundRect(8, 202, 98, 34, 6, DARKCYAN);
+  M5.Lcd.fillRoundRect(111, 202, 98, 34, 6, DARKCYAN);
+  M5.Lcd.fillRoundRect(214, 202, 98, 34, 6, DARKCYAN);
   M5.Lcd.setTextColor(WHITE, DARKCYAN);
-  M5.Lcd.setCursor(24, 212);
+  M5.Lcd.setCursor(18, 212);
   M5.Lcd.print("VIEWER");
-  M5.Lcd.setCursor(188, 212);
+  M5.Lcd.setCursor(130, 212);
   M5.Lcd.print("DETAIL");
+  M5.Lcd.setCursor(226, 212);
+  M5.Lcd.print("REFRESH");
 }
 
 void drawViewerScreen(bool connected, int screenshotBytes) {
@@ -402,11 +409,14 @@ UiMode handleTouch(UiMode mode) {
   TouchPoint_t p = M5.Touch.getPressPoint();
 
   if (mode == UiMode::HUD) {
-    if (p.y > 202 && p.x < 160) {
+    if (p.y > 202 && p.x < 107) {
       return UiMode::VIEWER;
     }
-    if (p.y > 202 && p.x >= 160) {
+    if (p.y > 202 && p.x < 214) {
       return UiMode::DETAIL;
+    }
+    if (p.y > 202) {
+      requestHudDataRefresh();
     }
   }
 
@@ -538,6 +548,7 @@ static void updateGamepadButtons() {
       currentMode = (currentMode == UiMode::VIEWER) ? UiMode::HUD : UiMode::VIEWER;
       if (currentMode == UiMode::HUD) {
         drawHudScreen(gameData);
+        requestHudDataRefresh();
       } else {
         drawViewerChrome();
         if (!displayJpegBuffer.empty()) {
@@ -624,6 +635,7 @@ void loop() {
     currentMode = nextMode;
     if (currentMode == UiMode::HUD) {
       drawHudScreen(gameData);
+      requestHudDataRefresh();
     } else if (currentMode == UiMode::VIEWER) {
       drawViewerChrome();
       if (!displayJpegBuffer.empty()) {
